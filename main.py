@@ -664,6 +664,76 @@ manifest_lock = threading.Lock()
 cooled_models: set[str] = set()
 cooled_lock = threading.Lock()
 
+# Per-model upstream stats: how many calls each free model served or
+# refused this trial, which statuses refused it, and how long its calls
+# took, fastest and slowest. Read-only observability only: nothing here
+# changes routing, model choice, or failover; the counters are filled
+# in around the gateway calls in serve() and read back by GET /stats.
+model_stats: dict[str, Json] = {}
+model_stats_lock = threading.Lock()
+trial_started = time.monotonic()
+
+
+def fresh_model_entry() -> Json:
+    """The counters for a model the trial has not dialled yet."""
+    return {'calls': 0, 'served': 0, 'refused': 0,
+            'refused_by_status': {}, 'last_latency_ms': None,
+            'fastest_ms': None, 'slowest_ms': None, 'last_status': None}
+
+
+def record_model_call(model: str, ok: bool, latency_ms: float, status: int | None) -> None:
+    """Fold one upstream call into the per-model counters."""
+    with model_stats_lock:
+        entry = model_stats.get(model)
+        if entry is None:
+            entry = fresh_model_entry()
+            model_stats[model] = entry
+        entry['calls'] = number_or_zero(entry.get('calls')) + 1
+        if ok:
+            entry['served'] = number_or_zero(entry.get('served')) + 1
+        if not ok:
+            entry['refused'] = number_or_zero(entry.get('refused')) + 1
+            if status is not None:
+                by_status = entry.get('refused_by_status')
+                if not is_record(by_status):
+                    by_status = {}
+                    entry['refused_by_status'] = by_status
+                key = str(status)
+                by_status[key] = number_or_zero(by_status.get(key)) + 1
+        fastest = entry.get('fastest_ms')
+        if not is_number(fastest) or latency_ms < fastest:
+            entry['fastest_ms'] = round(latency_ms, 3)
+        slowest = entry.get('slowest_ms')
+        if not is_number(slowest) or latency_ms > slowest:
+            entry['slowest_ms'] = round(latency_ms, 3)
+        entry['last_latency_ms'] = round(latency_ms, 3)
+        entry['last_status'] = status
+
+
+def stats_totals(entries: dict[str, Json]) -> Json:
+    """The trial-wide totals across one snapshot of the counters."""
+    calls = 0
+    served = 0
+    refused = 0
+    for entry in entries.values():
+        calls += number_or_zero(entry.get('calls'))
+        served += number_or_zero(entry.get('served'))
+        refused += number_or_zero(entry.get('refused'))
+    return {'calls': calls, 'served': served, 'refused': refused,
+            'models': len(entries)}
+
+
+def model_stats_snapshot() -> Json:
+    """A copy of the counters with trial-wide totals, models in id order,
+    for GET /stats. The copy is deep enough that a caller cannot mutate
+    the live counters through it."""
+    with model_stats_lock:
+        entries = {model_id: {**entry, 'refused_by_status': dict(entry.get('refused_by_status') or {})}
+                   for model_id, entry in sorted(model_stats.items())}
+    return {'models': entries,
+            'totals': stats_totals(entries),
+            'uptime_seconds': round(time.monotonic() - trial_started, 3)}
+
 
 def log(message: str) -> None:
     sys.stderr.write(f'aggregator: {message}\n')
@@ -796,18 +866,22 @@ def serve(body: Json, requires: Json) -> Served | None:
         if attempts >= MAX_GATEWAY_CALLS_PER_PROMPT:
             break
         attempts += 1
+        started = time.monotonic()
         try:
             upstream = dial(candidate['id'], body)
         except Exception:
             # Unreachable gateway or a timeout: no HTTP refusal exists, so
             # nothing is reported in the trail, but the model cools down.
+            record_model_call(candidate['id'], False, (time.monotonic() - started) * 1000, None)
             with cooled_lock:
                 cooled_models.add(candidate['id'])
             continue
         if upstream.ok:
+            record_model_call(candidate['id'], True, (time.monotonic() - started) * 1000, upstream.status)
             return Served(candidate['id'], upstream, failures)
         text = upstream.text()
         status = upstream.status
+        record_model_call(candidate['id'], False, (time.monotonic() - started) * 1000, status)
         with cooled_lock:
             cooled_models.add(candidate['id'])
         if 100 <= status <= 599:
@@ -844,6 +918,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.command == 'GET' and path == '/v1/models':
                 self.models()
+                return
+            if self.command == 'GET' and path == '/stats':
+                self.stats()
                 return
             if self.command == 'POST' and path == '/v1/chat/completions':
                 self.chat()
@@ -929,6 +1006,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, anthropic_model_list(listing))
         else:
             self.send_json(200, openai_model_list(listing))
+
+    def stats(self) -> None:
+        """GET /stats: the per-model upstream counters as JSON. Read-only:
+        it answers from the counters only and never dials the gateway."""
+        self.send_json(200, model_stats_snapshot())
 
     def chat(self) -> None:
         """POST /v1/chat/completions, answered by the best free model that
